@@ -1,5 +1,4 @@
 # Locatie op Unraid: /mnt/user/appdata/shopping-optimizer
-# Zet hier ook je .env bestand neer
 
 services:
   shopping-optimizer:
@@ -7,8 +6,12 @@ services:
     container_name: shopping-optimizer
     restart: unless-stopped
     ports:
-      - "${PORT:-8099}:${PORT:-8099}"
-    env_file:
-      - /mnt/user/appdata/shopping-optimizer/.env
+      - "8099:8099"
     environment:
-      - PORT=${PORT:-8099}
+      - HA_URL=http://jouw_ha_ip:8123
+      - HA_TOKEN=jouw_ha_token
+      - ANTHROPIC_API_KEY=jouw_anthropic_key
+      - WEBHOOK_SECRET=kies_een_sterk_geheim
+      - CLAUDE_MODEL=claude-opus-4-5
+      - REQUEST_TIMEOUT=10
+      - PORT=8099
