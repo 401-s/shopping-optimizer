@@ -24,10 +24,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Configuratie ──────────────────────────────────────────────────────────────
-HA_URL            = os.getenv("HA_URL", "http://192.168.1.108:8123")
+HA_URL            = os.getenv("HA_URL")
 HA_TOKEN          = os.getenv("HA_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "claude-opus-4-5")
+WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET")
 PORT              = int(os.getenv("PORT", "8099"))
+REQUEST_TIMEOUT   = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
 HEADERS = {
     "Authorization": f"Bearer {HA_TOKEN}",
@@ -38,30 +41,34 @@ HEADERS = {
 
 def get_shopping_list() -> list[dict]:
     """Haal alle niet-aangevinkte items op uit de HA shopping list."""
-    resp = requests.get(f"{HA_URL}/api/shopping_list", headers=HEADERS)
+    resp = requests.get(f"{HA_URL}/api/shopping_list", headers=HEADERS, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return [item for item in resp.json() if not item.get("complete", False)]
 
 
 def delete_item(item_name: str):
     """Verwijder één item op basis van naam via de todo service."""
-    requests.post(
+    resp = requests.post(
         f"{HA_URL}/api/services/todo/remove_item",
         headers=HEADERS,
         json={
             "entity_id": "todo.shopping_list",
             "item": item_name
-        }
+        },
+        timeout=REQUEST_TIMEOUT,
     )
+    resp.raise_for_status()
 
 
 def add_item(name: str):
     """Voeg een item toe aan de HA shopping list."""
-    requests.post(
+    resp = requests.post(
         f"{HA_URL}/api/shopping_list/item",
         headers=HEADERS,
-        json={"name": name}
+        json={"name": name},
+        timeout=REQUEST_TIMEOUT,
     )
+    resp.raise_for_status()
 
 
 # ── Claude: samenvoegen + categoriseren ──────────────────────────────────────
@@ -102,16 +109,20 @@ Boodschappenlijst:
 {items_text}"""
 
     message = client.messages.create(
-        model="claude-opus-4-5",
+        model=CLAUDE_MODEL,
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}]
     )
 
     response_text = message.content[0].text.strip()
+    # Verwijder optionele markdown code fences (```json ... ``` of ``` ... ```)
     if response_text.startswith("```"):
-        response_text = response_text.split("```")[1]
+        response_text = response_text.lstrip("`")
         if response_text.startswith("json"):
             response_text = response_text[4:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+        response_text = response_text.strip()
 
     return json.loads(response_text)
 
@@ -181,8 +192,18 @@ class WebhookHandler(BaseHTTPRequestHandler):
         else:
             self.send_json(404, {"error": "Niet gevonden"})
 
+    def _authorized(self) -> bool:
+        if not WEBHOOK_SECRET:
+            return True
+        token = self.headers.get("X-Webhook-Secret", "")
+        return token == WEBHOOK_SECRET
+
     def do_POST(self):
         if self.path == "/optimize":
+            if not self._authorized():
+                log.warning(f"Ongeautoriseerde aanvraag van {self.address_string()}")
+                self.send_json(401, {"error": "Ongeautoriseerd"})
+                return
             log.info("🛒 Optimize aanvraag ontvangen van HA")
             try:
                 result = run_optimizer()
@@ -197,6 +218,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
 # ── Start ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    if not HA_URL:
+        raise RuntimeError("HA_URL niet ingesteld")
     if not HA_TOKEN:
         raise RuntimeError("HA_TOKEN niet ingesteld")
     if not ANTHROPIC_API_KEY:
@@ -204,6 +227,6 @@ if __name__ == "__main__":
 
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
     log.info(f"🚀 Shopping List Optimizer gestart op poort {PORT}")
-    log.info(f"   POST http://192.168.1.108:{PORT}/optimize  → optimaliseer lijst")
-    log.info(f"   GET  http://192.168.1.108:{PORT}/health    → health check")
+    log.info(f"   POST http://0.0.0.0:{PORT}/optimize  → optimaliseer lijst")
+    log.info(f"   GET  http://0.0.0.0:{PORT}/health    → health check")
     server.serve_forever()

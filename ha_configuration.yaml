@@ -1,0 +1,35 @@
+# ── Home Assistant configuratie ───────────────────────────────────────────────
+#
+# Voeg dit toe aan je configuration.yaml (of een aparte package file)
+# om een knop op je dashboard te maken die de optimizer triggert.
+#
+# Vervang JOUW_SERVER_IP door het IP van je Unraid server.
+# Vervang JOUW_WEBHOOK_SECRET door dezelfde waarde als WEBHOOK_SECRET in je .env
+# (of verwijder de headers sectie als je geen WEBHOOK_SECRET gebruikt).
+
+# 1. REST command — stuurt de webhook naar de container
+rest_command:
+  optimize_shopping_list:
+    url: "http://JOUW_SERVER_IP:8099/optimize"
+    method: POST
+    content_type: "application/json"
+    headers:
+      X-Webhook-Secret: "JOUW_WEBHOOK_SECRET"
+
+# 2. Script — roept het REST command aan
+script:
+  optimize_shopping_list:
+    alias: "🛒 Optimaliseer boodschappenlijst"
+    sequence:
+      - action: rest_command.optimize_shopping_list
+
+# ── Dashboard knop ────────────────────────────────────────────────────────────
+#
+# Voeg dit toe aan je dashboard als een Button card:
+#
+# type: button
+# name: Optimaliseer boodschappenlijst
+# icon: mdi:cart-check
+# tap_action:
+#   action: perform-action
+#   perform_action: script.optimize_shopping_list
