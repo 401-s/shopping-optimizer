@@ -1,0 +1,13 @@
+# Tokens en secrets — NOOIT op GitHub!
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
