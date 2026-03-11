@@ -17,9 +17,14 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from anthropic import Anthropic
 
 # ── Logging ───────────────────────────────────────────────────────────────────
+os.makedirs("/app/data/logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("/app/data/logs/shopping-optimizer.log")
+    ]
 )
 log = logging.getLogger(__name__)
 
