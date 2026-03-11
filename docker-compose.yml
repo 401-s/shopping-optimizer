@@ -1,0 +1,14 @@
+# Locatie op Unraid: /mnt/user/appdata/shopping-optimizer
+# Zet hier ook je .env bestand neer
+
+services:
+  shopping-optimizer:
+    build: https://github.com/401-s/shopping-optimizer.git
+    container_name: shopping-optimizer
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8099}:${PORT:-8099}"
+    env_file:
+      - /mnt/user/appdata/shopping-optimizer/.env
+    environment:
+      - PORT=${PORT:-8099}
