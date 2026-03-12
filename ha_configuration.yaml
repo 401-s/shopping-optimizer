@@ -1,14 +1,15 @@
 # ── Home Assistant configuratie ───────────────────────────────────────────────
 #
 # Voeg dit toe aan je configuration.yaml (of een aparte package file)
-# om een knop op je dashboard te maken die de optimizer triggert.
+# om knoppen op je dashboard te maken die de optimizer triggert.
 #
 # Vervang JOUW_SERVER_IP door het IP van je Unraid server.
 # Vervang JOUW_WEBHOOK_SECRET door dezelfde waarde als WEBHOOK_SECRET in je .env
 # (of verwijder de headers sectie als je geen WEBHOOK_SECRET gebruikt).
 
-# 1. REST command — stuurt de webhook naar de container
+# 1. REST commands — sturen webhooks naar de container
 rest_command:
+  # Direct optimaliseren zonder bevestiging (oud gedrag)
   optimize_shopping_list:
     url: "http://JOUW_SERVER_IP:8099/optimize"
     method: POST
@@ -16,16 +17,59 @@ rest_command:
     headers:
       X-Webhook-Secret: "JOUW_WEBHOOK_SECRET"
 
-# 2. Script — roept het REST command aan
+  # Stap 1: Vraag Claude een voorstel te maken (geen wijzigingen toegepast)
+  preview_shopping_list:
+    url: "http://JOUW_SERVER_IP:8099/preview"
+    method: POST
+    content_type: "application/json"
+    headers:
+      X-Webhook-Secret: "JOUW_WEBHOOK_SECRET"
+
+  # Stap 2a: Bevestig en pas de voorgestelde wijzigingen toe
+  confirm_shopping_list:
+    url: "http://JOUW_SERVER_IP:8099/confirm"
+    method: POST
+    content_type: "application/json"
+    headers:
+      X-Webhook-Secret: "JOUW_WEBHOOK_SECRET"
+
+  # Stap 2b: Annuleer het voorstel, lijst blijft ongewijzigd
+  cancel_shopping_list:
+    url: "http://JOUW_SERVER_IP:8099/cancel"
+    method: POST
+    content_type: "application/json"
+    headers:
+      X-Webhook-Secret: "JOUW_WEBHOOK_SECRET"
+
+# 2. Scripts — roepen de REST commands aan
 script:
+  # Direct optimaliseren (zonder bevestiging)
   optimize_shopping_list:
-    alias: "🛒 Optimaliseer boodschappenlijst"
+    alias: "Optimaliseer boodschappenlijst (direct)"
     sequence:
       - action: rest_command.optimize_shopping_list
 
-# ── Dashboard knop ────────────────────────────────────────────────────────────
+  # Met bevestiging: stap 1 — maak voorstel
+  preview_shopping_list:
+    alias: "Bekijk optimalisatie-voorstel"
+    sequence:
+      - action: rest_command.preview_shopping_list
+
+  # Met bevestiging: stap 2a — bevestig voorstel
+  confirm_shopping_list:
+    alias: "Bevestig optimalisatie"
+    sequence:
+      - action: rest_command.confirm_shopping_list
+
+  # Met bevestiging: stap 2b — annuleer voorstel
+  cancel_shopping_list:
+    alias: "Annuleer optimalisatie"
+    sequence:
+      - action: rest_command.cancel_shopping_list
+
+# ── Dashboard knoppen ─────────────────────────────────────────────────────────
 #
-# Voeg dit toe aan je dashboard als een Button card:
+# Optie A: Direct optimaliseren (oud gedrag, één knop)
 #
 # type: button
 # name: Optimaliseer boodschappenlijst
@@ -33,3 +77,30 @@ script:
 # tap_action:
 #   action: perform-action
 #   perform_action: script.optimize_shopping_list
+#
+# Optie B: Met bevestiging (drie knoppen op je dashboard)
+#
+# Knop 1 — Maak voorstel:
+# type: button
+# name: Bekijk voorstel
+# icon: mdi:cart-search
+# tap_action:
+#   action: perform-action
+#   perform_action: script.preview_shopping_list
+#
+# Knop 2 — Bevestig:
+# type: button
+# name: Bevestig
+# icon: mdi:check-circle
+# tap_action:
+#   action: perform-action
+#   perform_action: script.confirm_shopping_list
+#
+# Knop 3 — Annuleer:
+# type: button
+# name: Annuleer
+# icon: mdi:close-circle
+# tap_action:
+#   action: perform-action
+#   perform_action: script.cancel_shopping_list
+#

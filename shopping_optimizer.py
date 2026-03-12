@@ -76,6 +76,37 @@ def add_item(name: str):
     resp.raise_for_status()
 
 
+def notify_preview(categories: dict[str, list[str]], original_count: int):
+    """Stuur een persistente HA-notificatie met het optimalisatievoorstel."""
+    lines = [f"**{len(sum(categories.values(), []))} items** (was {original_count}):\n"]
+    for cat, cat_items in sorted(categories.items()):
+        lines.append(f"**{cat}**")
+        for name in cat_items:
+            lines.append(f"- {name}")
+    lines.append("\nBevestig via *Bevestig optimalisatie* of annuleer via *Annuleer optimalisatie*.")
+
+    requests.post(
+        f"{HA_URL}/api/services/persistent_notification/create",
+        headers=HEADERS,
+        json={
+            "title": "Optimalisatie voorstel",
+            "message": "\n".join(lines),
+            "notification_id": "shopping_optimizer_preview",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+
+
+def dismiss_preview_notification():
+    """Verwijder de preview-notificatie na bevestigen of annuleren."""
+    requests.post(
+        f"{HA_URL}/api/services/persistent_notification/dismiss",
+        headers=HEADERS,
+        json={"notification_id": "shopping_optimizer_preview"},
+        timeout=REQUEST_TIMEOUT,
+    )
+
+
 # ── Claude: samenvoegen + categoriseren ──────────────────────────────────────
 
 def optimize_with_claude(items: list[dict]) -> list[dict]:
@@ -132,10 +163,111 @@ Boodschappenlijst:
     return json.loads(response_text)
 
 
+# ── Pending changes (in-memory) ───────────────────────────────────────────────
+
+_pending: dict = {}  # Slaat preview resultaat op totdat bevestigd of geannuleerd
+
+
 # ── Optimizer logica ──────────────────────────────────────────────────────────
 
+def _build_categories(optimized: list[dict]) -> dict[str, list[str]]:
+    categories: dict[str, list[str]] = {}
+    for item in optimized:
+        cat = item["category"]
+        categories.setdefault(cat, []).append(item["name"])
+    return categories
+
+
+def _apply_changes(original_items: list[dict], categories: dict[str, list[str]]):
+    """Verwijder oude items en voeg geoptimaliseerde items toe aan HA."""
+    log.info("Oude items verwijderen...")
+    for item in original_items:
+        delete_item(item["name"])
+
+    log.info("Nieuwe items toevoegen...")
+    for cat, cat_items in sorted(categories.items()):
+        for name in cat_items:
+            add_item(f"[{cat}] {name}")
+
+
+def run_preview() -> dict:
+    """
+    Haal de lijst op en laat Claude optimaliseren, maar sla de wijzigingen op
+    zonder ze toe te passen. Geeft een preview terug ter bevestiging.
+    """
+    global _pending
+
+    log.info("Ophalen van HA shopping list (preview)...")
+    items = get_shopping_list()
+
+    if not items:
+        log.info("Lijst is leeg, niets te doen.")
+        _pending = {}
+        return {"status": "ok", "message": "Lijst is leeg, niets te doen.", "items": 0}
+
+    log.info(f"{len(items)} items gevonden: {[i['name'] for i in items]}")
+
+    log.info("Claude optimaliseert de lijst (preview)...")
+    optimized = optimize_with_claude(items)
+    categories = _build_categories(optimized)
+
+    log.info(f"Voorgestelde lijst ({len(optimized)} items):")
+    for cat, cat_items in sorted(categories.items()):
+        log.info(f"  [{cat}] {', '.join(cat_items)}")
+
+    _pending = {"original_items": items, "categories": categories}
+
+    notify_preview(categories, len(items))
+
+    return {
+        "status": "preview",
+        "message": "Bekijk de voorgestelde wijzigingen. Stuur POST /confirm om toe te passen of POST /cancel om te annuleren.",
+        "original_count": len(items),
+        "optimized_count": len(optimized),
+        "categories": {cat: items for cat, items in categories.items()}
+    }
+
+
+def run_confirm() -> dict:
+    """Pas de opgeslagen preview-wijzigingen toe."""
+    global _pending
+
+    if not _pending:
+        return {"status": "error", "message": "Geen wijzigingen klaar. Stuur eerst een POST naar /preview."}
+
+    original_items = _pending["original_items"]
+    categories = _pending["categories"]
+    optimized_count = sum(len(v) for v in categories.values())
+
+    _apply_changes(original_items, categories)
+    _pending = {}
+    dismiss_preview_notification()
+
+    log.info("✅ Optimalisatie bevestigd en toegepast!")
+    return {
+        "status": "ok",
+        "message": "Shopping list geoptimaliseerd!",
+        "original_count": len(original_items),
+        "optimized_count": optimized_count,
+        "categories": {cat: items for cat, items in categories.items()}
+    }
+
+
+def run_cancel() -> dict:
+    """Gooi de opgeslagen preview-wijzigingen weg."""
+    global _pending
+
+    if not _pending:
+        return {"status": "ok", "message": "Geen wijzigingen om te annuleren."}
+
+    _pending = {}
+    dismiss_preview_notification()
+    log.info("Optimalisatie geannuleerd, lijst ongewijzigd.")
+    return {"status": "ok", "message": "Wijzigingen geannuleerd. Lijst is niet aangepast."}
+
+
 def run_optimizer() -> dict:
-    """Voer de volledige optimalisatie uit. Geeft een resultaat dict terug."""
+    """Voer de volledige optimalisatie direct uit (zonder bevestigingsstap)."""
     log.info("Ophalen van HA shopping list...")
     items = get_shopping_list()
 
@@ -147,24 +279,13 @@ def run_optimizer() -> dict:
 
     log.info("Claude optimaliseert de lijst...")
     optimized = optimize_with_claude(items)
-
-    categories: dict[str, list[str]] = {}
-    for item in optimized:
-        cat = item["category"]
-        categories.setdefault(cat, []).append(item["name"])
+    categories = _build_categories(optimized)
 
     log.info(f"Geoptimaliseerde lijst ({len(optimized)} items):")
     for cat, cat_items in sorted(categories.items()):
         log.info(f"  [{cat}] {', '.join(cat_items)}")
 
-    log.info("Oude items verwijderen...")
-    for item in items:
-        delete_item(item["name"])
-
-    log.info("Nieuwe items toevoegen...")
-    for cat, cat_items in sorted(categories.items()):
-        for name in cat_items:
-            add_item(f"[{cat}] {name}")
+    _apply_changes(items, categories)
 
     log.info("✅ Optimalisatie voltooid!")
     return {
@@ -204,17 +325,26 @@ class WebhookHandler(BaseHTTPRequestHandler):
         return token == WEBHOOK_SECRET
 
     def do_POST(self):
-        if self.path == "/optimize":
-            if not self._authorized():
-                log.warning(f"Ongeautoriseerde aanvraag van {self.address_string()}")
-                self.send_json(401, {"error": "Ongeautoriseerd"})
-                return
-            log.info("🛒 Optimize aanvraag ontvangen van HA")
+        if not self._authorized():
+            log.warning(f"Ongeautoriseerde aanvraag van {self.address_string()}")
+            self.send_json(401, {"error": "Ongeautoriseerd"})
+            return
+
+        handlers = {
+            "/optimize": ("🛒 Optimize aanvraag ontvangen van HA", run_optimizer),
+            "/preview":  ("🔍 Preview aanvraag ontvangen van HA", run_preview),
+            "/confirm":  ("✅ Confirm aanvraag ontvangen van HA", run_confirm),
+            "/cancel":   ("❌ Cancel aanvraag ontvangen van HA", run_cancel),
+        }
+
+        if self.path in handlers:
+            msg, fn = handlers[self.path]
+            log.info(msg)
             try:
-                result = run_optimizer()
+                result = fn()
                 self.send_json(200, result)
             except Exception as e:
-                log.error(f"Fout tijdens optimalisatie: {e}")
+                log.error(f"Fout tijdens {self.path}: {e}")
                 self.send_json(500, {"status": "error", "message": str(e)})
         else:
             self.send_json(404, {"error": "Niet gevonden"})
