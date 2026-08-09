@@ -146,9 +146,18 @@ Boodschappenlijst:
 
     message = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=1024,
+        max_tokens=4096,
         messages=[{"role": "user", "content": prompt}]
     )
+
+    if message.stop_reason == "max_tokens":
+        log.error(
+            f"Claude-antwoord afgekapt door max_tokens (lengte {len(message.content[0].text)} tekens)."
+        )
+        raise RuntimeError(
+            "Claude's antwoord was te lang en is afgekapt (max_tokens bereikt). "
+            "Probeer de lijst te verkleinen of max_tokens te verhogen."
+        )
 
     response_text = message.content[0].text.strip()
     # Verwijder optionele markdown code fences (```json ... ``` of ``` ... ```)
@@ -160,7 +169,14 @@ Boodschappenlijst:
             response_text = response_text[:-3]
         response_text = response_text.strip()
 
-    return json.loads(response_text)
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        log.error(
+            f"Kon Claude-antwoord niet als JSON parsen (stop_reason={message.stop_reason}, "
+            f"lengte={len(response_text)}). Laatste 500 tekens: {response_text[-500:]!r}"
+        )
+        raise
 
 
 # ── Pending changes (in-memory) ───────────────────────────────────────────────
