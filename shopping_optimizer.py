@@ -14,6 +14,8 @@ import logging
 import os
 import re
 import threading
+from dataclasses import dataclass, field
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
@@ -42,7 +44,8 @@ HEADERS = {
 }
 
 # Volgorde = looproute door de supermarkt; zo komt de lijst ook in HA te staan.
-CATEGORIES = [
+# Aan te passen via categorieen.json in DATA_DIR (zie load_settings).
+DEFAULT_CATEGORIES = [
     "Groente & Fruit",
     "Brood & Bakkerij",
     "Vlees & Vis",
@@ -56,8 +59,18 @@ CATEGORIES = [
     "Overig",
 ]
 
-# Alleen bekende categorie-prefixen strippen, zodat bijv. "[2x] melk" blijft staan.
-_PREFIX_RE = re.compile(r"^\[(?:" + "|".join(re.escape(c) for c in CATEGORIES) + r")\]\s*")
+# Geschatte prijzen in dollar per miljoen tokens (input, output), voor de kostenlog.
+PRICES = {
+    "claude-opus-5-5":   (4.0, 20.0),
+    "claude-opus-5":     (5.0, 25.0),
+    "claude-opus-4-8":   (5.0, 25.0),
+    "claude-opus-4-7":   (5.0, 25.0),
+    "claude-opus-4-6":   (5.0, 25.0),
+    "claude-opus-4-5":   (5.0, 25.0),
+    "claude-sonnet-5":   (2.0, 10.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5":  (1.0, 5.0),
+}
 
 NOTIFY_PREVIEW = "shopping_optimizer_preview"
 NOTIFY_RESULT  = "shopping_optimizer_result"
@@ -77,10 +90,60 @@ class PartialApplyError(Exception):
     """Toevoegen liep halverwege mis; originele items staan er nog."""
 
 
-def strip_prefix(name: str) -> str:
-    """Verwijder (eventueel meerdere) categorie-prefixen van een eerdere run."""
+@dataclass
+class Settings:
+    categories: list[str]                                # winkelvolgorde
+    fixed: dict[str, str] = field(default_factory=dict)  # product (kleine letters) → categorie
+
+
+def load_settings() -> Settings:
+    """
+    Lees DATA_DIR/categorieen.json (optioneel), bij elke run opnieuw:
+    {"volgorde": ["Groente & Fruit", ...], "vast": {"hagelslag": "Brood & Bakkerij"}}
+    """
+    path = os.path.join(DATA_DIR, "categorieen.json")
+    try:
+        # utf-8-sig: Windows-editors zetten soms een BOM voor het bestand
+        with open(path, encoding="utf-8-sig") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return Settings(list(DEFAULT_CATEGORIES))
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"categorieen.json is ongeldig: {e}") from e
+    if not isinstance(raw, dict):
+        raise ValueError("categorieen.json moet een object zijn met 'volgorde' en/of 'vast'.")
+
+    order = raw.get("volgorde") or list(DEFAULT_CATEGORIES)
+    if not isinstance(order, list) or not all(isinstance(c, str) and c.strip() for c in order):
+        raise ValueError("'volgorde' in categorieen.json moet een lijst met categorienamen zijn.")
+    order = [c.strip() for c in order]
+    if len(set(order)) != len(order):
+        raise ValueError("'volgorde' in categorieen.json bevat een categorie twee keer.")
+    if any("[" in c or "]" in c for c in order):
+        raise ValueError("Categorienamen in categorieen.json mogen geen [ of ] bevatten.")
+    if "Overig" not in order:
+        order.append("Overig")
+
+    fixed_raw = raw.get("vast") or {}
+    if not isinstance(fixed_raw, dict):
+        raise ValueError("'vast' in categorieen.json moet een object zijn: {\"product\": \"categorie\"}.")
+    fixed = {}
+    for product, category in fixed_raw.items():
+        if category not in order:
+            raise ValueError(f"Vaste categorie {category!r} voor {product!r} staat niet in de volgorde.")
+        fixed[product.strip().lower()] = category
+
+    return Settings(order, fixed)
+
+
+def strip_prefix(name: str, categories: list[str] = DEFAULT_CATEGORIES) -> str:
+    """
+    Verwijder (eventueel meerdere) categorie-prefixen van een eerdere run.
+    Alleen bekende categorieën, zodat bijv. "[2x] melk" blijft staan.
+    """
+    prefix_re = re.compile(r"^\[(?:" + "|".join(re.escape(c) for c in categories) + r")\]\s*")
     while True:
-        stripped = _PREFIX_RE.sub("", name, count=1)
+        stripped = prefix_re.sub("", name, count=1)
         if stripped == name:
             return name.strip()
         name = stripped
@@ -159,26 +222,28 @@ def _safe(fn, *args):
 
 # ── Claude: samenvoegen + categoriseren ──────────────────────────────────────
 
-OUTPUT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "items": {
-            "type": "array",
+def _output_schema(categories: list[str]) -> dict:
+    return {
+        "type": "object",
+        "properties": {
             "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "category": {"type": "string", "enum": CATEGORIES},
-                    "sources": {"type": "array", "items": {"type": "integer"}},
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "category": {"type": "string", "enum": categories},
+                        "sources": {"type": "array", "items": {"type": "integer"}},
+                    },
+                    "required": ["name", "category", "sources"],
+                    "additionalProperties": False,
                 },
-                "required": ["name", "category", "sources"],
-                "additionalProperties": False,
             },
         },
-    },
-    "required": ["items"],
-    "additionalProperties": False,
-}
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+
 
 _client: Anthropic | None = None
 
@@ -190,12 +255,18 @@ def _anthropic() -> Anthropic:
     return _client
 
 
-def optimize_with_claude(names: list[str]) -> list[dict]:
+def optimize_with_claude(names: list[str], settings: Settings | None = None) -> tuple[list[dict], str | None]:
     """
     Stuur de ruwe boodschappenlijst naar Claude.
-    Geeft een lijst terug van: {"name": "3 uien", "category": "Groente & Fruit", "sources": [1, 4]}
+    Geeft (items, kostenregel) terug; items zijn {"name": "3 uien", "category": "Groente & Fruit", "sources": [1, 4]}.
     """
+    settings = settings or Settings(list(DEFAULT_CATEGORIES))
     items_text = "\n".join(f"{i}. {name}" for i, name in enumerate(names, start=1))
+    fixed_text = ""
+    if settings.fixed:
+        rules = "\n".join(f"- {product} → {category}" for product, category in settings.fixed.items())
+        fixed_text = f"\nVaste afspraken; gebruik voor deze producten altijd deze categorie:\n{rules}\n"
+
     prompt = f"""Je krijgt een genummerde boodschappenlijst. Doe het volgende:
 1. Voeg duplicaten samen, ook als ze anders gespeld zijn of een hoeveelheid hebben
    (bijv. "ui" en "2 uien" → "3 uien"). Laat items die geen duplicaat zijn ongewijzigd.
@@ -204,11 +275,11 @@ def optimize_with_claude(names: list[str]) -> list[dict]:
    Elk origineel nummer moet bij minstens één item voorkomen; voeg geen nieuwe items toe.
 
 Zet de categorie niet in de naam en houd de namen in het Nederlands.
-
+{fixed_text}
 Boodschappenlijst:
 {items_text}"""
 
-    output_config = {"format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}}
+    output_config = {"format": {"type": "json_schema", "schema": _output_schema(settings.categories)}}
     if CLAUDE_EFFORT:
         output_config["effort"] = CLAUDE_EFFORT
     request = dict(
@@ -228,6 +299,8 @@ Boodschappenlijst:
     else:
         message = client.messages.create(**request)
 
+    cost = record_usage(message)
+
     if message.stop_reason == "refusal":
         raise RuntimeError("Claude weigerde het verzoek (stop_reason=refusal).")
     if message.stop_reason == "max_tokens":
@@ -245,18 +318,19 @@ Boodschappenlijst:
         log.error(f"Kon Claude-antwoord niet parsen (lengte={len(text)}). Laatste 500 tekens: {text[-500:]!r}")
         raise
 
-    validate_result(items, len(names))
-    return items
+    validate_result(items, len(names), settings.categories)
+    apply_fixed(items, settings.fixed)
+    return items, cost
 
 
-def validate_result(items: list[dict], original_count: int):
+def validate_result(items: list[dict], original_count: int, categories: list[str] = DEFAULT_CATEGORIES):
     """Controleer dat Claude geen items heeft weggelaten of verzonnen."""
     covered: set[int] = set()
     for item in items:
-        item["name"] = strip_prefix(item.get("name", ""))
+        item["name"] = strip_prefix(item.get("name", ""), _known_categories(categories))
         if not item["name"]:
             raise ValueError("Claude gaf een item zonder naam terug.")
-        if item.get("category") not in CATEGORIES:
+        if item.get("category") not in categories:
             raise ValueError(f"Onbekende categorie van Claude: {item.get('category')!r}")
         sources = item.get("sources") or []
         if not sources:
@@ -271,11 +345,73 @@ def validate_result(items: list[dict], original_count: int):
         raise ValueError(f"Claude liet originele items weg (nummers {sorted(missing)}); lijst niet aangepast.")
 
 
+def apply_fixed(items: list[dict], fixed: dict[str, str]):
+    """
+    Dwing vaste afspraken af, ook als Claude ze negeert. Een afspraak geldt als het
+    product als los woord in de naam staat ("hagelslag" matcht "2 pakken hagelslag",
+    "melk" matcht niet "karnemelk"); bij meerdere matches wint de langste.
+    """
+    for item in items:
+        matches = [
+            product for product in fixed
+            if re.search(rf"(?<!\w){re.escape(product)}(?!\w)", item["name"], re.IGNORECASE)
+        ]
+        if not matches:
+            continue
+        category = fixed[max(matches, key=len)]
+        if item["category"] != category:
+            log.info(f"Vaste afspraak: {item['name']!r} naar {category} (Claude koos {item['category']})")
+            item["category"] = category
+
+
+def _known_categories(categories: list[str]) -> list[str]:
+    """Huidige plus standaardcategorieën, zodat ook oude prefixen gestript worden."""
+    return categories + [c for c in DEFAULT_CATEGORIES if c not in categories]
+
+
+# ── Kosten ────────────────────────────────────────────────────────────────────
+
+def _price(model: str) -> tuple[float, float] | None:
+    for name in sorted(PRICES, key=len, reverse=True):
+        if model.startswith(name):
+            return PRICES[name]
+    return None
+
+
+def record_usage(message) -> str | None:
+    """Log tokengebruik en geschatte kosten, en tel ze op per maand in usage.json."""
+    usage = getattr(message, "usage", None)
+    if usage is None:
+        return None
+    model = getattr(message, "model", None) or CLAUDE_MODEL
+    tokens_in, tokens_out = usage.input_tokens or 0, usage.output_tokens or 0
+    price = _price(model)
+    cost = (tokens_in * price[0] + tokens_out * price[1]) / 1_000_000 if price else None
+
+    month = datetime.now().strftime("%Y-%m")
+    totals = dict(_state["usage"] or {})
+    current = dict(totals.get(month, {"runs": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}))
+    current["runs"] += 1
+    current["input_tokens"] += tokens_in
+    current["output_tokens"] += tokens_out
+    current["cost_usd"] = round(current["cost_usd"] + (cost or 0.0), 6)
+    totals[month] = current
+    _set_state("usage", totals)
+
+    if cost is None:
+        line = f"{tokens_in} input / {tokens_out} output tokens ({model}, prijs onbekend)"
+    else:
+        line = (f"ca. ${cost:.3f} ({tokens_in} input / {tokens_out} output tokens); "
+                f"deze maand ${current['cost_usd']:.2f} over {current['runs']} runs")
+    log.info(f"💰 Kosten: {line}")
+    return line
+
+
 # ── Plan maken en toepassen ───────────────────────────────────────────────────
 
-def _build_categories(optimized: list[dict]) -> dict[str, list[str]]:
+def _build_categories(optimized: list[dict], order: list[str] = DEFAULT_CATEGORIES) -> dict[str, list[str]]:
     """Groepeer op categorie, in winkelvolgorde."""
-    categories: dict[str, list[str]] = {cat: [] for cat in CATEGORIES}
+    categories: dict[str, list[str]] = {cat: [] for cat in order}
     for item in optimized:
         categories[item["category"]].append(item["name"])
     return {cat: names for cat, names in categories.items() if names}
@@ -287,23 +423,26 @@ def _count(categories: dict[str, list[str]]) -> int:
 
 def build_plan() -> dict | None:
     """Haal de lijst op en laat Claude een voorstel maken. None als de lijst leeg is."""
+    settings = load_settings()
+
     log.info("Ophalen van HA boodschappenlijst...")
     items = get_shopping_list()
     if not items:
         log.info("Lijst is leeg, niets te doen.")
         return None
 
-    names = [strip_prefix(item["name"]) for item in items]
+    names = [strip_prefix(item["name"], _known_categories(settings.categories)) for item in items]
     log.info(f"{len(items)} items gevonden: {names}")
 
     log.info(f"Claude ({CLAUDE_MODEL}) optimaliseert de lijst...")
-    categories = _build_categories(optimize_with_claude(names))
+    optimized, cost = optimize_with_claude(names, settings)
+    categories = _build_categories(optimized, settings.categories)
 
     log.info(f"Voorgestelde lijst ({_count(categories)} items):")
     for cat, cat_items in categories.items():
         log.info(f"  [{cat}] {', '.join(cat_items)}")
 
-    return {"original": items, "categories": categories}
+    return {"original": items, "categories": categories, "cost": cost}
 
 
 def _replace(remove_uids: list[str], add_names: list[str]):
@@ -377,8 +516,9 @@ def _summary(plan: dict) -> dict:
 # ── Status op schijf (overleeft een herstart) ─────────────────────────────────
 # "pending": voorstel dat wacht op bevestiging
 # "undo":    wat nodig is om de laatste optimalisatie terug te draaien
+# "usage":   tokengebruik en geschatte kosten per maand
 
-_state: dict[str, dict | None] = {"pending": None, "undo": None}
+_state: dict[str, dict | None] = {"pending": None, "undo": None, "usage": None}
 
 
 def _state_file(key: str) -> str:
@@ -415,8 +555,10 @@ def _load_state():
 
 # ── Acties ────────────────────────────────────────────────────────────────────
 
-def _notify_done(s: dict):
+def _notify_done(s: dict, cost: str | None = None):
     message = f"{s['optimized_count']} items (was {s['original_count']})."
+    if cost:
+        message += f"\n\nKosten: {cost}."
     _safe(notify, "Boodschappenlijst geoptimaliseerd", message, NOTIFY_RESULT)
     _safe(notify_phone, "Boodschappenlijst geoptimaliseerd", message, [(ACTION_UNDO, "Ongedaan maken")])
 
@@ -437,6 +579,8 @@ def job_preview():
         lines.append(f"**{cat}**")
         lines.extend(f"- {name}" for name in cat_items)
     lines.append("\nBevestig via *Bevestig optimalisatie* of annuleer via *Annuleer optimalisatie*.")
+    if plan.get("cost"):
+        lines.append(f"\n_Kosten: {plan['cost']}._")
     notify("Optimalisatie voorstel", "\n".join(lines), NOTIFY_PREVIEW)
 
     phone_lines = [f"{header}:"]
@@ -452,7 +596,7 @@ def job_optimize():
         return
     apply_plan(plan)
     log.info("✅ Optimalisatie voltooid!")
-    _notify_done(_summary(plan))
+    _notify_done(_summary(plan), plan.get("cost"))
 
 
 def _close_preview():
@@ -566,7 +710,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self.send_json(200, {"status": "ok", "busy": _busy.locked(),
-                                 "pending": bool(_state["pending"]), "undo": bool(_state["undo"])})
+                                 "pending": bool(_state["pending"]), "undo": bool(_state["undo"]),
+                                 "usage": _state["usage"] or {}})
         else:
             self.send_json(404, {"error": "Niet gevonden"})
 

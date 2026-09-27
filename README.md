@@ -2,7 +2,9 @@
 
 Optimaliseert je Home Assistant boodschappenlijst via Claude AI:
 - Voegt duplicaten samen (ook bij verschillende spellingen of hoeveelheden)
-- Groepeert items op categorie, in de volgorde van een looproute door de supermarkt
+- Groepeert items op categorie, in de volgorde van een looproute door de supermarkt (zelf aan te passen)
+- Vaste afspraken per product, bijv. hagelslag altijd bij *Brood & Bakkerij*
+- Houdt bij wat elke optimalisatie kost (per run en per maand)
 - Optioneel met bevestigingsstap: eerst een voorstel als HA-notificatie, daarna bevestigen of annuleren
 - Optioneel een melding op je telefoon met knoppen *Bevestig* / *Annuleer* / *Ongedaan maken*
 - Laatste optimalisatie ongedaan maken met één knop
@@ -78,6 +80,31 @@ Daarin staan ook voorbeelden voor dashboardknoppen: één knop om direct te opti
 
 Je krijgt dan het voorstel op je telefoon met *Bevestig* en *Annuleer*, en na het toepassen een melding met *Ongedaan maken*.
 
+## Winkelvolgorde en vaste afspraken
+
+Maak (optioneel) `/mnt/user/appdata/shopping-optimizer/categorieen.json` aan; een voorbeeld staat in [`categorieen.example.json`](categorieen.example.json):
+
+```json
+{
+  "volgorde": ["Groente & Fruit", "Brood & Bakkerij", "Zuivel & Eieren", "Dranken", "Overig"],
+  "vast": {
+    "hagelslag": "Brood & Bakkerij",
+    "wc-papier": "Schoonmaak & Verzorging"
+  }
+}
+```
+
+- **`volgorde`**: de categorieën in de volgorde van jouw looproute. Je kunt categorieën weglaten, hernoemen of toevoegen (bijv. `"Drogisterij"`). `Overig` wordt automatisch achteraan toegevoegd als hij ontbreekt.
+- **`vast`**: producten die altijd in een bepaalde categorie horen. Claude krijgt ze mee, en de optimizer dwingt ze daarna ook zelf af. Een afspraak geldt als het product als los woord in de naam staat: `hagelslag` geldt ook voor `2 pakken hagelslag`, maar `melk` niet voor `karnemelk`.
+
+Het bestand wordt bij elke run opnieuw gelezen, dus je hoeft de container niet te herstarten. Staat er een fout in, dan krijg je een HA-notificatie *Optimalisatie mislukt* met uitleg en blijft je lijst ongewijzigd.
+
+## Kosten
+
+Na elke run logt de optimizer het tokengebruik en een schatting van de kosten, plus het totaal van de huidige maand. De kosten staan ook in de voorstel-notificatie en in de melding na direct optimaliseren. De maandtotalen staan in `/app/data/usage.json` en in de uitvoer van `GET /health`.
+
+De schatting gebruikt de standaard API-prijzen die in de code staan (`PRICES`); bij een onbekend model worden alleen de tokens gelogd.
+
 ## Configuratie
 
 | Variabele | Verplicht | Standaard | Beschrijving |
@@ -93,7 +120,7 @@ Je krijgt dan het voorstel op je telefoon met *Bevestig* en *Annuleer*, en na he
 | `NOTIFY_SERVICE` | nee | leeg (uit) | Notify-service van je telefoon, bijv. `mobile_app_pixel_8`, voor meldingen met knoppen |
 | `REQUEST_TIMEOUT` | nee | `10` | Timeout (seconden) voor aanroepen naar HA |
 | `PORT` | nee | `8099` | Poort van de webserver |
-| `DATA_DIR` | nee | `/app/data` | Map voor logs en het openstaande voorstel |
+| `DATA_DIR` | nee | `/app/data` | Map voor logs, openstaand voorstel, undo, kosten en `categorieen.json` |
 
 ## Endpoints
 
@@ -101,7 +128,7 @@ Alle POST-endpoints vereisen de header `X-Webhook-Secret`. Er draait maximaal é
 
 | Methode | URL | Beschrijving |
 |---------|-----|--------------|
-| GET | `/health` | Controleert of de container draait |
+| GET | `/health` | Controleert of de container draait; toont ook de kosten per maand |
 | POST | `/preview` | Maakt op de achtergrond een voorstel en toont het als HA-notificatie (`202`) |
 | POST | `/confirm` | Past het openstaande voorstel toe |
 | POST | `/cancel` | Gooit het openstaande voorstel weg |
