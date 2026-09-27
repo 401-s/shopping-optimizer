@@ -45,6 +45,15 @@ rest_command:
     headers:
       X-Webhook-Secret: "JOUW_WEBHOOK_SECRET"
 
+  # Draai de laatste optimalisatie terug
+  undo_shopping_list:
+    url: "http://JOUW_SERVER_IP:8099/undo"
+    method: POST
+    content_type: "application/json"
+    timeout: 60
+    headers:
+      X-Webhook-Secret: "JOUW_WEBHOOK_SECRET"
+
 # 2. Scripts — roepen de REST commands aan
 script:
   # Direct optimaliseren (zonder bevestiging)
@@ -70,6 +79,54 @@ script:
     alias: "Annuleer optimalisatie"
     sequence:
       - action: rest_command.cancel_shopping_list
+
+  # Laatste optimalisatie ongedaan maken
+  undo_shopping_list:
+    alias: "Maak optimalisatie ongedaan"
+    sequence:
+      - action: rest_command.undo_shopping_list
+
+# 3. Automation — koppelt de knoppen in de telefoonmelding aan de optimizer
+#    Alleen nodig als je NOTIFY_SERVICE instelt in de container.
+#    "automation shopping_optimizer:" (met label) botst niet met een bestaande
+#    "automation: !include automations.yaml" regel.
+automation shopping_optimizer:
+  - alias: "Boodschappenlijst optimizer — telefoonknoppen"
+    id: shopping_optimizer_phone_actions
+    mode: queued
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: SHOPPING_OPTIMIZER_CONFIRM
+        id: confirm
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: SHOPPING_OPTIMIZER_CANCEL
+        id: cancel
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: SHOPPING_OPTIMIZER_UNDO
+        id: undo
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: confirm
+            sequence:
+              - action: rest_command.confirm_shopping_list
+          - conditions:
+              - condition: trigger
+                id: cancel
+            sequence:
+              - action: rest_command.cancel_shopping_list
+          - conditions:
+              - condition: trigger
+                id: undo
+            sequence:
+              - action: rest_command.undo_shopping_list
 
 # ── Dashboard knoppen ─────────────────────────────────────────────────────────
 #
@@ -107,4 +164,12 @@ script:
 # tap_action:
 #   action: perform-action
 #   perform_action: script.cancel_shopping_list
+#
+# Vangnet — Ongedaan maken (werkt voor beide opties):
+# type: button
+# name: Ongedaan maken
+# icon: mdi:undo
+# tap_action:
+#   action: perform-action
+#   perform_action: script.undo_shopping_list
 #

@@ -15,7 +15,8 @@ import shopping_optimizer as so
 def isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(so, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(so, "WEBHOOK_SECRET", "geheim")
-    monkeypatch.setattr(so, "_pending", None)
+    monkeypatch.setattr(so, "_state", {"pending": None, "undo": None})
+    monkeypatch.setattr(so, "NOTIFY_SERVICE", "")
     monkeypatch.setattr(so, "CLAUDE_FALLBACKS", "default")
     monkeypatch.setattr(so, "CLAUDE_EFFORT", "low")
 
@@ -148,7 +149,7 @@ PLAN = {
 }
 
 
-def test_apply_plan_adds_before_removing_by_uid(monkeypatch):
+def test_apply_plan_adds_before_removing_by_uid_and_stores_undo(monkeypatch):
     calls = []
     monkeypatch.setattr(so, "get_shopping_list", lambda: [{"uid": "u1", "name": "ui"}, {"uid": "u2", "name": "2 uien"}])
     monkeypatch.setattr(so, "add_item", lambda name: calls.append(("add", name)))
@@ -157,6 +158,7 @@ def test_apply_plan_adds_before_removing_by_uid(monkeypatch):
     so.apply_plan(PLAN)
 
     assert calls == [("add", "[Groente & Fruit] 3 uien"), ("remove", ["u1", "u2"])]
+    assert so._state["undo"] == {"restore": ["ui", "2 uien"], "added": ["[Groente & Fruit] 3 uien"]}
 
 
 def test_apply_plan_aborts_on_stale_list_before_any_add(monkeypatch):
@@ -182,42 +184,160 @@ def test_apply_plan_keeps_originals_when_add_fails(monkeypatch):
     with pytest.raises(so.PartialApplyError, match=r"1 van 2.*\[Groente & Fruit\] 3 uien"):
         so.apply_plan(plan)
     remove.assert_not_called()
-
-
-def test_confirm_after_partial_failure_clears_pending(monkeypatch):
-    so._set_pending(PLAN)
-    monkeypatch.setattr(so, "apply_plan", MagicMock(side_effect=so.PartialApplyError("half")))
-    monkeypatch.setattr(so, "dismiss", MagicMock())
-
-    code, body = so.run_confirm()
-
-    assert code == 409 and body["message"] == "half"
-    assert so._pending is None
+    assert so._state["undo"] is None
 
 
 # ── Pending + confirm ────────────────────────────────────────────────────────
 
-def test_pending_survives_reload(monkeypatch):
-    so._set_pending(PLAN)
-    monkeypatch.setattr(so, "_pending", None)
-    so._load_pending()
-    assert so._pending == PLAN
+def test_state_survives_reload(monkeypatch):
+    so._set_state("pending", PLAN)
+    so._set_state("undo", UNDO)
+    monkeypatch.setattr(so, "_state", {"pending": None, "undo": None})
+    so._load_state()
+    assert so._state == {"pending": PLAN, "undo": UNDO}
 
 
-def test_confirm_on_stale_list_clears_pending(monkeypatch):
-    so._set_pending(PLAN)
-    monkeypatch.setattr(so, "apply_plan", MagicMock(side_effect=so.StaleListError("gewijzigd")))
+@pytest.mark.parametrize("error", [so.StaleListError("gewijzigd"), so.PartialApplyError("half")])
+def test_confirm_failure_clears_pending(monkeypatch, error):
+    so._set_state("pending", PLAN)
+    monkeypatch.setattr(so, "apply_plan", MagicMock(side_effect=error))
     monkeypatch.setattr(so, "dismiss", MagicMock())
 
     code, body = so.run_confirm()
 
-    assert code == 409 and "gewijzigd" in body["message"]
-    assert so._pending is None
+    assert code == 409 and body["message"] == str(error)
+    assert so._state["pending"] is None
 
 
 def test_confirm_without_pending_is_409():
     code, _ = so.run_confirm()
     assert code == 409
+
+
+# ── Undo ──────────────────────────────────────────────────────────────────────
+
+UNDO = {"restore": ["ui", "2 uien", "melk"], "added": ["[Groente & Fruit] 3 uien", "[Zuivel & Eieren] melk"]}
+
+
+def test_undo_restores_originals_before_removing_added_items(monkeypatch):
+    so._set_state("undo", UNDO)
+    calls = []
+    monkeypatch.setattr(so, "get_shopping_list", lambda: [
+        {"uid": "n1", "name": "[Groente & Fruit] 3 uien"},
+        {"uid": "n2", "name": "[Zuivel & Eieren] melk"},
+        {"uid": "x", "name": "brood"},  # later toegevoegd, blijft staan
+    ])
+    monkeypatch.setattr(so, "add_item", lambda name: calls.append(("add", name)))
+    monkeypatch.setattr(so, "remove_items", lambda uids: calls.append(("remove", uids)))
+    monkeypatch.setattr(so, "notify", MagicMock())
+
+    code, body = so.run_undo()
+
+    assert code == 200 and body["restored_count"] == 3
+    assert calls == [("add", "ui"), ("add", "2 uien"), ("add", "melk"), ("remove", ["n1", "n2"])]
+    assert so._state["undo"] is None
+
+
+def test_undo_handles_duplicate_names(monkeypatch):
+    so._set_state("undo", {"restore": ["melk", "melk"],
+                           "added": ["[Zuivel & Eieren] melk", "[Zuivel & Eieren] melk"]})
+    remove = MagicMock()
+    monkeypatch.setattr(so, "get_shopping_list", lambda: [
+        {"uid": "a", "name": "[Zuivel & Eieren] melk"},
+        {"uid": "b", "name": "[Zuivel & Eieren] melk"},
+    ])
+    monkeypatch.setattr(so, "add_item", MagicMock())
+    monkeypatch.setattr(so, "remove_items", remove)
+
+    so.undo_last()
+
+    assert sorted(remove.call_args.args[0]) == ["a", "b"]
+
+
+def test_undo_refuses_when_added_item_is_gone(monkeypatch):
+    so._set_state("undo", UNDO)
+    add = MagicMock()
+    monkeypatch.setattr(so, "get_shopping_list", lambda: [{"uid": "n1", "name": "[Groente & Fruit] 3 uien"}])
+    monkeypatch.setattr(so, "add_item", add)
+    monkeypatch.setattr(so, "remove_items", MagicMock())
+
+    code, body = so.run_undo()
+
+    assert code == 409 and "melk" in body["message"]
+    add.assert_not_called()
+    assert so._state["undo"] == UNDO  # blijft bewaard; er is niets gewijzigd
+
+
+def test_undo_partial_failure_clears_history(monkeypatch):
+    so._set_state("undo", UNDO)
+    monkeypatch.setattr(so, "undo_last", MagicMock(side_effect=so.PartialApplyError("half")))
+
+    assert so.run_undo()[0] == 409
+    assert so._state["undo"] is None
+
+
+def test_failed_remove_clears_state_so_retry_cannot_duplicate(monkeypatch):
+    monkeypatch.setattr(so, "get_shopping_list", lambda: PLAN["original"])
+    monkeypatch.setattr(so, "add_item", MagicMock())
+    monkeypatch.setattr(so, "remove_items", MagicMock(side_effect=RuntimeError("HA weg")))
+    monkeypatch.setattr(so, "dismiss", MagicMock())
+
+    so._set_state("pending", PLAN)
+    code, body = so.run_confirm()
+    assert code == 409 and "met de hand" in body["message"]
+    assert so._state["pending"] is None
+
+    so._set_state("undo", {"restore": ["ui"], "added": ["ui"]})
+    code, body = so.run_undo()
+    assert code == 409 and "met de hand" in body["message"]
+    assert so._state["undo"] is None
+
+
+def test_undo_without_history_is_409():
+    assert so.run_undo()[0] == 409
+
+
+# ── Telefoonmeldingen ────────────────────────────────────────────────────────
+
+def test_notify_phone_does_nothing_without_service(monkeypatch):
+    call = MagicMock()
+    monkeypatch.setattr(so, "_call_service", call)
+    so.notify_phone("t", "m", [(so.ACTION_CONFIRM, "Bevestig")])
+    so.clear_phone()
+    call.assert_not_called()
+
+
+def phone_calls(call):
+    return [c.args[2] for c in call.call_args_list if c.args[:2] == ("notify", "mobile_app_pixel")]
+
+
+def test_preview_sends_phone_notification_with_actions(monkeypatch):
+    monkeypatch.setattr(so, "NOTIFY_SERVICE", "mobile_app_pixel")
+    monkeypatch.setattr(so, "build_plan", lambda: PLAN)
+    call = MagicMock(return_value={})
+    monkeypatch.setattr(so, "_call_service", call)
+
+    so.job_preview()
+
+    [data] = phone_calls(call)
+    assert "Groente & Fruit: 3 uien" in data["message"]
+    assert data["data"]["tag"] == so.PHONE_TAG
+    assert [a["action"] for a in data["data"]["actions"]] == [so.ACTION_CONFIRM, so.ACTION_CANCEL]
+    assert so._state["pending"] == PLAN
+
+
+def test_confirm_clears_preview_and_offers_undo(monkeypatch):
+    monkeypatch.setattr(so, "NOTIFY_SERVICE", "mobile_app_pixel")
+    so._set_state("pending", PLAN)
+    monkeypatch.setattr(so, "apply_plan", MagicMock())
+    call = MagicMock(return_value={})
+    monkeypatch.setattr(so, "_call_service", call)
+
+    assert so.run_confirm()[0] == 200
+
+    phone = phone_calls(call)
+    assert phone[0]["message"] == "clear_notification"
+    assert phone[-1]["data"]["actions"][0]["action"] == so.ACTION_UNDO
 
 
 # ── HTTP server ───────────────────────────────────────────────────────────────
@@ -249,6 +369,7 @@ def test_busy_returns_409(server):
     try:
         assert post(f"{server}/preview")[0] == 409
         assert post(f"{server}/confirm")[0] == 409
+        assert post(f"{server}/undo")[0] == 409
     finally:
         so._busy.release()
 

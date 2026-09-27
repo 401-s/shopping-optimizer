@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -v
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bouw het Docker image (zonder te pushen)
+        run: docker build -t shopping-optimizer:ci .
+      - name: Start de container en controleer de health check
+        run: |
+          docker run -d --name so -p 8099:8099 \
+            -e HA_URL=http://127.0.0.1:1 -e HA_TOKEN=x \
+            -e ANTHROPIC_API_KEY=x -e WEBHOOK_SECRET=ci \
+            shopping-optimizer:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8099/health; then exit 0; fi
+            sleep 1
+          done
+          docker logs so
+          exit 1
