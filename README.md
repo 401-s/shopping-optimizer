@@ -4,10 +4,12 @@ Optimaliseert je Home Assistant boodschappenlijst via Claude AI:
 - Voegt duplicaten samen (ook bij verschillende spellingen of hoeveelheden)
 - Groepeert items op categorie, in de volgorde van een looproute door de supermarkt
 - Optioneel met bevestigingsstap: eerst een voorstel als HA-notificatie, daarna bevestigen of annuleren
+- Optioneel een melding op je telefoon met knoppen *Bevestig* / *Annuleer* / *Ongedaan maken*
+- Laatste optimalisatie ongedaan maken met één knop
 - Draait als Docker container op Unraid
 - Triggerbaar via knoppen op je HA dashboard
 
-Vereist Home Assistant 2024.1 of nieuwer (gebruikt de `todo.*` services).
+Vereist Home Assistant 2024.10 of nieuwer (gebruikt de `todo.*` services en de nieuwe automation-syntax).
 
 ## Veiligheid van je lijst
 
@@ -15,6 +17,7 @@ Vereist Home Assistant 2024.1 of nieuwer (gebruikt de `todo.*` services).
 - Claude moet bij elk item aangeven uit welke originele items het bestaat. Valt er een item weg, dan wordt het voorstel afgekeurd en blijft de lijst ongewijzigd.
 - Is de lijst tussen voorstel en bevestiging gewijzigd (item afgevinkt of verwijderd), dan wordt het voorstel geweigerd en moet je een nieuw voorstel maken.
 - Eerdere categorie-prefixen (`[Groente & Fruit] ...`) worden gestript, dus je kunt de optimizer vaker achter elkaar draaien.
+- Na elke optimalisatie wordt de oude lijst bewaard. `/undo` zet hem terug, zolang de toegevoegde items nog op de lijst staan; items die je daarna zelf hebt toegevoegd blijven staan.
 
 ## Installatie
 
@@ -66,7 +69,14 @@ services:
 
 ### 4. Configureer Home Assistant
 Voeg de inhoud van `ha_configuration.yaml` toe aan je `configuration.yaml` en herstart HA.
-Daarin staan ook voorbeelden voor dashboardknoppen: één knop om direct te optimaliseren, of drie knoppen (voorstel / bevestig / annuleer).
+Daarin staan ook voorbeelden voor dashboardknoppen: één knop om direct te optimaliseren, of drie knoppen (voorstel / bevestig / annuleer), plus een knop *Ongedaan maken*.
+
+### 5. (Optioneel) Meldingen met knoppen op je telefoon
+1. Zoek de naam van je telefoon-notify-service: in HA onder **Ontwikkelhulpmiddelen → Acties**, zoek op `notify.mobile_app`. Bijvoorbeeld `notify.mobile_app_pixel_8`.
+2. Zet in je `docker-compose.yml`: `NOTIFY_SERVICE=mobile_app_pixel_8` en herstart de container.
+3. Zorg dat de automation *Boodschappenlijst optimizer — telefoonknoppen* uit `ha_configuration.yaml` in HA staat. Die koppelt de knoppen in de melding aan de optimizer.
+
+Je krijgt dan het voorstel op je telefoon met *Bevestig* en *Annuleer*, en na het toepassen een melding met *Ongedaan maken*.
 
 ## Configuratie
 
@@ -80,6 +90,7 @@ Daarin staan ook voorbeelden voor dashboardknoppen: één knop om direct te opti
 | `CLAUDE_EFFORT` | nee | `low` | Denkinspanning (`low`–`max`). Leeg laten voor modellen die dit niet ondersteunen (zoals Haiku) |
 | `CLAUDE_FALLBACKS` | nee | leeg (uit) | `default` laat de API een geweigerd verzoek automatisch op een ander model herhalen. Alleen voor Claude Opus 5 / Fable; de voorbeeld-compose zet het aan |
 | `TODO_ENTITY` | nee | `todo.shopping_list` | Welke todo-lijst geoptimaliseerd wordt |
+| `NOTIFY_SERVICE` | nee | leeg (uit) | Notify-service van je telefoon, bijv. `mobile_app_pixel_8`, voor meldingen met knoppen |
 | `REQUEST_TIMEOUT` | nee | `10` | Timeout (seconden) voor aanroepen naar HA |
 | `PORT` | nee | `8099` | Poort van de webserver |
 | `DATA_DIR` | nee | `/app/data` | Map voor logs en het openstaande voorstel |
@@ -95,6 +106,7 @@ Alle POST-endpoints vereisen de header `X-Webhook-Secret`. Er draait maximaal é
 | POST | `/confirm` | Past het openstaande voorstel toe |
 | POST | `/cancel` | Gooit het openstaande voorstel weg |
 | POST | `/optimize` | Optimaliseert direct, zonder bevestiging, op de achtergrond (`202`) |
+| POST | `/undo` | Draait de laatste optimalisatie terug |
 
 Fouten bij achtergrondtaken verschijnen als HA-notificatie *Optimalisatie mislukt* en in `/app/data/logs/shopping-optimizer.log`.
 
@@ -114,3 +126,5 @@ Fouten bij achtergrondtaken verschijnen als HA-notificatie *Optimalisatie misluk
 pip install -r requirements-dev.txt
 pytest
 ```
+
+Bij elke push naar `main` en elke pull request draait GitHub Actions de tests en bouwt het Docker image.

@@ -16,6 +16,8 @@ services:
       - CLAUDE_EFFORT=low
       - CLAUDE_FALLBACKS=default
       - TODO_ENTITY=todo.shopping_list
+      # Optioneel: meldingen met knoppen op je telefoon (Developer tools → Actions → zoek 'notify.mobile_app')
+      - NOTIFY_SERVICE=
       - REQUEST_TIMEOUT=10
       - PORT=8099
     volumes:

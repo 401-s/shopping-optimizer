@@ -31,6 +31,7 @@ CLAUDE_EFFORT     = os.getenv("CLAUDE_EFFORT", "low")          # leeg = niet mee
 CLAUDE_FALLBACKS  = os.getenv("CLAUDE_FALLBACKS", "")          # "default" = aan (Opus 5 / Fable)
 WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET")
 TODO_ENTITY       = os.getenv("TODO_ENTITY", "todo.shopping_list")
+NOTIFY_SERVICE    = os.getenv("NOTIFY_SERVICE", "").removeprefix("notify.")  # bijv. mobile_app_pixel_8
 DATA_DIR          = os.getenv("DATA_DIR", "/app/data")
 PORT              = int(os.getenv("PORT", "8099"))
 REQUEST_TIMEOUT   = int(os.getenv("REQUEST_TIMEOUT", "10"))
@@ -60,6 +61,12 @@ _PREFIX_RE = re.compile(r"^\[(?:" + "|".join(re.escape(c) for c in CATEGORIES) +
 
 NOTIFY_PREVIEW = "shopping_optimizer_preview"
 NOTIFY_RESULT  = "shopping_optimizer_result"
+PHONE_TAG      = "shopping_optimizer"
+
+# Acties op de telefoonmelding; een HA-automation koppelt ze aan de endpoints.
+ACTION_CONFIRM = "SHOPPING_OPTIMIZER_CONFIRM"
+ACTION_CANCEL  = "SHOPPING_OPTIMIZER_CANCEL"
+ACTION_UNDO    = "SHOPPING_OPTIMIZER_UNDO"
 
 
 class StaleListError(Exception):
@@ -125,6 +132,21 @@ def notify(title: str, message: str, notification_id: str):
 
 def dismiss(notification_id: str):
     _call_service("persistent_notification", "dismiss", {"notification_id": notification_id})
+
+
+def notify_phone(title: str, message: str, actions: list[tuple[str, str]] | None = None):
+    """Melding via de HA Companion-app, optioneel met actieknoppen. Doet niets zonder NOTIFY_SERVICE."""
+    if not NOTIFY_SERVICE:
+        return
+    data: dict = {"tag": PHONE_TAG}
+    if actions:
+        data["actions"] = [{"action": action, "title": label} for action, label in actions]
+    _call_service("notify", NOTIFY_SERVICE, {"title": title, "message": message, "data": data})
+
+
+def clear_phone():
+    if NOTIFY_SERVICE:
+        _call_service("notify", NOTIFY_SERVICE, {"message": "clear_notification", "data": {"tag": PHONE_TAG}})
 
 
 def _safe(fn, *args):
@@ -284,11 +306,35 @@ def build_plan() -> dict | None:
     return {"original": items, "categories": categories}
 
 
+def _replace(remove_uids: list[str], add_names: list[str]):
+    """
+    Eerst nieuwe items toevoegen, daarna de oude items op uid verwijderen.
+    Gaat er halverwege iets mis, dan staan de oude items er nog.
+    """
+    log.info(f"{len(add_names)} items toevoegen...")
+    for added, name in enumerate(add_names):
+        try:
+            add_item(name)
+        except Exception as e:
+            done = ", ".join(add_names[:added]) or "geen"
+            raise PartialApplyError(
+                f"Toevoegen mislukt na {added} van {len(add_names)} items ({e}). "
+                f"De oude items staan er nog. Al toegevoegd: {done}. "
+                "Verwijder die en probeer het opnieuw."
+            ) from e
+
+    log.info(f"{len(remove_uids)} oude items verwijderen...")
+    try:
+        remove_items(remove_uids)
+    except Exception as e:
+        raise PartialApplyError(
+            f"Alle nieuwe items zijn toegevoegd, maar het verwijderen van de oude items mislukte ({e}). "
+            "Verwijder de oude items met de hand."
+        ) from e
+
+
 def apply_plan(plan: dict):
-    """
-    Pas een plan toe: eerst nieuwe items toevoegen, daarna de originele items op uid
-    verwijderen. Gaat er halverwege iets mis, dan staan de originele items er nog.
-    """
+    """Pas een plan toe en bewaar wat nodig is om het ongedaan te maken."""
     current_uids = {item["uid"] for item in get_shopping_list()}
     gone = [o["name"] for o in plan["original"] if o["uid"] not in current_uids]
     if gone:
@@ -298,20 +344,26 @@ def apply_plan(plan: dict):
         )
 
     new_names = [f"[{cat}] {name}" for cat, names in plan["categories"].items() for name in names]
-    log.info(f"{len(new_names)} nieuwe items toevoegen...")
-    for added, name in enumerate(new_names):
-        try:
-            add_item(name)
-        except Exception as e:
-            done = ", ".join(new_names[:added]) or "geen"
-            raise PartialApplyError(
-                f"Toevoegen mislukt na {added} van {len(new_names)} items ({e}). "
-                f"De originele items staan er nog. Al toegevoegd: {done}. "
-                "Verwijder die en maak een nieuw voorstel."
-            ) from e
+    _replace([o["uid"] for o in plan["original"]], new_names)
+    _set_state("undo", {"restore": [o["name"] for o in plan["original"]], "added": new_names})
 
-    log.info(f"{len(plan['original'])} originele items verwijderen...")
-    remove_items([o["uid"] for o in plan["original"]])
+
+def undo_last():
+    """Zet de lijst terug naar hoe hij was vóór de laatste optimalisatie."""
+    undo = _state["undo"]
+    uids_by_name: dict[str, list[str]] = {}
+    for item in get_shopping_list():
+        uids_by_name.setdefault(item["name"], []).append(item["uid"])
+
+    remove_uids = []
+    for name in undo["added"]:
+        if not uids_by_name.get(name):
+            raise StaleListError(
+                f"{name!r} staat niet meer op de lijst; ongedaan maken is niet meer veilig mogelijk."
+            )
+        remove_uids.append(uids_by_name[name].pop())
+
+    _replace(remove_uids, undo["restore"])
 
 
 def _summary(plan: dict) -> dict:
@@ -322,60 +374,75 @@ def _summary(plan: dict) -> dict:
     }
 
 
-# ── Pending voorstel (bewaard op schijf, overleeft een herstart) ──────────────
+# ── Status op schijf (overleeft een herstart) ─────────────────────────────────
+# "pending": voorstel dat wacht op bevestiging
+# "undo":    wat nodig is om de laatste optimalisatie terug te draaien
 
-_pending: dict | None = None
-
-
-def _pending_file() -> str:
-    return os.path.join(DATA_DIR, "pending.json")
+_state: dict[str, dict | None] = {"pending": None, "undo": None}
 
 
-def _set_pending(plan: dict | None):
-    global _pending
-    _pending = plan
+def _state_file(key: str) -> str:
+    return os.path.join(DATA_DIR, f"{key}.json")
+
+
+def _set_state(key: str, value: dict | None):
+    _state[key] = value
+    path = _state_file(key)
     try:
-        if plan is None:
-            if os.path.exists(_pending_file()):
-                os.remove(_pending_file())
+        if value is None:
+            if os.path.exists(path):
+                os.remove(path)
         else:
-            tmp = _pending_file() + ".tmp"
+            tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(plan, f, ensure_ascii=False)
-            os.replace(tmp, _pending_file())
+                json.dump(value, f, ensure_ascii=False)
+            os.replace(tmp, path)
     except OSError as e:
-        log.warning(f"Kon voorstel niet op schijf bewaren ({e}); het gaat verloren bij een herstart.")
+        log.warning(f"Kon {key} niet op schijf bewaren ({e}); het gaat verloren bij een herstart.")
 
 
-def _load_pending():
-    global _pending
-    try:
-        with open(_pending_file(), encoding="utf-8") as f:
-            _pending = json.load(f)
-        log.info("Openstaand voorstel geladen van schijf.")
-    except FileNotFoundError:
-        pass
-    except (OSError, json.JSONDecodeError) as e:
-        log.warning(f"Kon opgeslagen voorstel niet laden: {e}")
+def _load_state():
+    for key in _state:
+        try:
+            with open(_state_file(key), encoding="utf-8") as f:
+                _state[key] = json.load(f)
+            log.info(f"Opgeslagen {key} geladen van schijf.")
+        except FileNotFoundError:
+            pass
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning(f"Kon opgeslagen {key} niet laden: {e}")
 
 
 # ── Acties ────────────────────────────────────────────────────────────────────
 
+def _notify_done(s: dict):
+    message = f"{s['optimized_count']} items (was {s['original_count']})."
+    _safe(notify, "Boodschappenlijst geoptimaliseerd", message, NOTIFY_RESULT)
+    _safe(notify_phone, "Boodschappenlijst geoptimaliseerd", message, [(ACTION_UNDO, "Ongedaan maken")])
+
+
 def job_preview():
     """Maak een voorstel en toon het als HA-notificatie (achtergrondtaak)."""
     plan = build_plan()
-    _set_pending(plan)
+    _set_state("pending", plan)
     if plan is None:
         _safe(dismiss, NOTIFY_PREVIEW)
+        _safe(clear_phone)
         notify("Boodschappenlijst", "Lijst is leeg, niets te doen.", NOTIFY_RESULT)
         return
 
-    lines = [f"**{_count(plan['categories'])} items** (was {len(plan['original'])}):\n"]
+    header = f"{_count(plan['categories'])} items (was {len(plan['original'])})"
+    lines = [f"**{header}**:\n"]
     for cat, cat_items in plan["categories"].items():
         lines.append(f"**{cat}**")
         lines.extend(f"- {name}" for name in cat_items)
     lines.append("\nBevestig via *Bevestig optimalisatie* of annuleer via *Annuleer optimalisatie*.")
     notify("Optimalisatie voorstel", "\n".join(lines), NOTIFY_PREVIEW)
+
+    phone_lines = [f"{header}:"]
+    phone_lines += [f"{cat}: {', '.join(cat_items)}" for cat, cat_items in plan["categories"].items()]
+    _safe(notify_phone, "Optimalisatie voorstel", "\n".join(phone_lines),
+          [(ACTION_CONFIRM, "Bevestig"), (ACTION_CANCEL, "Annuleer")])
 
 
 def job_optimize():
@@ -385,40 +452,68 @@ def job_optimize():
         return
     apply_plan(plan)
     log.info("✅ Optimalisatie voltooid!")
-    s = _summary(plan)
-    _safe(notify, "Boodschappenlijst geoptimaliseerd",
-          f"{s['optimized_count']} items (was {s['original_count']}).", NOTIFY_RESULT)
+    _notify_done(_summary(plan))
+
+
+def _close_preview():
+    _set_state("pending", None)
+    _safe(dismiss, NOTIFY_PREVIEW)
+    _safe(clear_phone)
 
 
 def run_confirm() -> tuple[int, dict]:
     """Pas het opgeslagen voorstel toe."""
-    if not _pending:
+    plan = _state["pending"]
+    if not plan:
         return 409, {"status": "error", "message": "Geen voorstel klaar. Stuur eerst een POST naar /preview."}
 
-    plan = _pending
     try:
         apply_plan(plan)
     except (StaleListError, PartialApplyError) as e:
         # Voorstel weggooien: nog eens bevestigen zou items dubbel toevoegen.
         log.warning(str(e))
-        _set_pending(None)
-        _safe(dismiss, NOTIFY_PREVIEW)
+        _close_preview()
+        _safe(notify_phone, "Optimalisatie mislukt", str(e))
         return 409, {"status": "error", "message": str(e)}
 
-    _set_pending(None)
-    _safe(dismiss, NOTIFY_PREVIEW)
+    _close_preview()
     log.info("✅ Optimalisatie bevestigd en toegepast!")
-    return 200, {"status": "ok", "message": "Boodschappenlijst geoptimaliseerd!", **_summary(plan)}
+    s = _summary(plan)
+    _notify_done(s)
+    return 200, {"status": "ok", "message": "Boodschappenlijst geoptimaliseerd!", **s}
 
 
 def run_cancel() -> tuple[int, dict]:
     """Gooi het opgeslagen voorstel weg."""
-    if not _pending:
+    if not _state["pending"]:
         return 200, {"status": "ok", "message": "Geen voorstel om te annuleren."}
-    _set_pending(None)
-    _safe(dismiss, NOTIFY_PREVIEW)
+    _close_preview()
     log.info("Optimalisatie geannuleerd, lijst ongewijzigd.")
     return 200, {"status": "ok", "message": "Voorstel geannuleerd. Lijst is niet aangepast."}
+
+
+def run_undo() -> tuple[int, dict]:
+    """Draai de laatste optimalisatie terug."""
+    undo = _state["undo"]
+    if not undo:
+        return 409, {"status": "error", "message": "Er is niets om ongedaan te maken."}
+
+    try:
+        undo_last()
+    except (StaleListError, PartialApplyError) as e:
+        # Na een halve mislukking zou nog eens proberen items dubbel toevoegen.
+        if isinstance(e, PartialApplyError):
+            _set_state("undo", None)
+        log.warning(str(e))
+        _safe(notify_phone, "Ongedaan maken mislukt", str(e))
+        return 409, {"status": "error", "message": str(e)}
+
+    _set_state("undo", None)
+    _safe(clear_phone)
+    message = f"Optimalisatie ongedaan gemaakt ({len(undo['restore'])} items teruggezet)."
+    _safe(notify, "Boodschappenlijst", message, NOTIFY_RESULT)
+    log.info("↩️ " + message)
+    return 200, {"status": "ok", "message": message, "restored_count": len(undo["restore"])}
 
 
 # ── Webhook server ────────────────────────────────────────────────────────────
@@ -437,6 +532,7 @@ def _start_background(path: str, job) -> bool:
         except Exception as e:
             log.exception(f"Fout tijdens {path}")
             _safe(notify, "Optimalisatie mislukt", str(e), NOTIFY_RESULT)
+            _safe(notify_phone, "Optimalisatie mislukt", str(e))
         finally:
             _busy.release()
 
@@ -453,6 +549,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
     SYNC = {
         "/confirm": ("✅ Confirm aanvraag ontvangen", run_confirm),
         "/cancel":  ("❌ Cancel aanvraag ontvangen", run_cancel),
+        "/undo":    ("↩️ Undo aanvraag ontvangen", run_undo),
     }
 
     def log_message(self, format, *args):
@@ -468,7 +565,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self.send_json(200, {"status": "ok", "busy": _busy.locked(), "pending": bool(_pending)})
+            self.send_json(200, {"status": "ok", "busy": _busy.locked(),
+                                 "pending": bool(_state["pending"]), "undo": bool(_state["undo"])})
         else:
             self.send_json(404, {"error": "Niet gevonden"})
 
@@ -539,7 +637,7 @@ def main():
         if not value:
             raise RuntimeError(f"{name} niet ingesteld")
 
-    _load_pending()
+    _load_state()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), WebhookHandler)
     server.daemon_threads = True
     log.info(f"🚀 Shopping List Optimizer gestart op poort {PORT} (model {CLAUDE_MODEL}, lijst {TODO_ENTITY})")
@@ -547,6 +645,9 @@ def main():
     log.info("   POST /confirm   → pas voorstel toe")
     log.info("   POST /cancel    → annuleer voorstel")
     log.info("   POST /optimize  → optimaliseer direct, zonder bevestiging")
+    log.info("   POST /undo      → draai de laatste optimalisatie terug")
+    if NOTIFY_SERVICE:
+        log.info(f"   Telefoonmeldingen via notify.{NOTIFY_SERVICE}")
     log.info("   GET  /health    → health check")
     server.serve_forever()
 
