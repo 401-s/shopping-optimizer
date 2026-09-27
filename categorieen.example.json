@@ -1,0 +1,20 @@
+{
+  "volgorde": [
+    "Groente & Fruit",
+    "Brood & Bakkerij",
+    "Vlees & Vis",
+    "Zuivel & Eieren",
+    "Pasta, Rijst & Granen",
+    "Sauzen & Conserven",
+    "Snoep & Snacks",
+    "Dranken",
+    "Schoonmaak & Verzorging",
+    "Diepvries",
+    "Overig"
+  ],
+  "vast": {
+    "hagelslag": "Brood & Bakkerij",
+    "pindakaas": "Brood & Bakkerij",
+    "wc-papier": "Schoonmaak & Verzorging"
+  }
+}

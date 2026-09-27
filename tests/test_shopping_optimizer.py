@@ -15,7 +15,7 @@ import shopping_optimizer as so
 def isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(so, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(so, "WEBHOOK_SECRET", "geheim")
-    monkeypatch.setattr(so, "_state", {"pending": None, "undo": None})
+    monkeypatch.setattr(so, "_state", {"pending": None, "undo": None, "usage": None})
     monkeypatch.setattr(so, "NOTIFY_SERVICE", "")
     monkeypatch.setattr(so, "CLAUDE_FALLBACKS", "default")
     monkeypatch.setattr(so, "CLAUDE_EFFORT", "low")
@@ -56,9 +56,10 @@ def test_optimize_reads_text_block_after_thinking(monkeypatch):
     client = fake_client(msg)
     monkeypatch.setattr(so, "_client", client)
 
-    result = so.optimize_with_claude(["ui", "2 uien"])
+    result, cost = so.optimize_with_claude(["ui", "2 uien"])
 
     assert result == [{"name": "3 uien", "category": "Groente & Fruit", "sources": [1, 2]}]
+    assert cost is None  # nep-antwoord zonder usage
     kwargs = client.beta.messages.create.call_args.kwargs
     assert kwargs["fallbacks"] == "default"
     assert kwargs["betas"] == ["server-side-fallback-2026-07-01"]
@@ -192,9 +193,9 @@ def test_apply_plan_keeps_originals_when_add_fails(monkeypatch):
 def test_state_survives_reload(monkeypatch):
     so._set_state("pending", PLAN)
     so._set_state("undo", UNDO)
-    monkeypatch.setattr(so, "_state", {"pending": None, "undo": None})
+    monkeypatch.setattr(so, "_state", {"pending": None, "undo": None, "usage": None})
     so._load_state()
-    assert so._state == {"pending": PLAN, "undo": UNDO}
+    assert so._state == {"pending": PLAN, "undo": UNDO, "usage": None}
 
 
 @pytest.mark.parametrize("error", [so.StaleListError("gewijzigd"), so.PartialApplyError("half")])
@@ -382,3 +383,128 @@ def test_preview_runs_in_background_and_returns_202(server, monkeypatch):
 
     assert code == 202 and body["status"] == "accepted"
     assert done.wait(2)
+
+
+# ── Categorie-instellingen (categorieen.json) ────────────────────────────────
+
+def write_settings(tmp_path, data):
+    (tmp_path / "categorieen.json").write_text(
+        data if isinstance(data, str) else json.dumps(data), encoding="utf-8"
+    )
+
+
+def test_settings_default_without_file():
+    settings = so.load_settings()
+    assert settings.categories == so.DEFAULT_CATEGORIES
+    assert settings.fixed == {}
+
+
+def test_settings_custom_order_appends_overig_and_normalizes_fixed(tmp_path):
+    write_settings(tmp_path, {
+        "volgorde": ["Brood & Bakkerij", "Groente & Fruit", "Drogisterij"],
+        "vast": {" Hagelslag ": "Brood & Bakkerij"},
+    })
+    settings = so.load_settings()
+    assert settings.categories == ["Brood & Bakkerij", "Groente & Fruit", "Drogisterij", "Overig"]
+    assert settings.fixed == {"hagelslag": "Brood & Bakkerij"}
+
+
+def test_settings_accepts_file_with_bom(tmp_path):
+    (tmp_path / "categorieen.json").write_text(
+        json.dumps({"vast": {"hagelslag": "Brood & Bakkerij"}}), encoding="utf-8-sig"
+    )
+    assert so.load_settings().fixed == {"hagelslag": "Brood & Bakkerij"}
+
+
+@pytest.mark.parametrize("data, match", [
+    ("{kapot", "ongeldig"),
+    ({"vast": {"hagelslag": "Ontbijt"}}, "Ontbijt"),
+    ({"volgorde": ["Dranken", "Dranken"]}, "twee keer"),
+    ({"volgorde": ["[Dranken]"]}, r"\["),
+    ({"volgorde": "Dranken"}, "lijst"),
+])
+def test_settings_rejects_invalid_file(tmp_path, data, match):
+    write_settings(tmp_path, data)
+    with pytest.raises(ValueError, match=match):
+        so.load_settings()
+
+
+def test_apply_fixed_uses_word_boundaries_and_longest_match():
+    items = [
+        {"name": "2 pakken Hagelslag", "category": "Snoep & Snacks"},
+        {"name": "karnemelk", "category": "Zuivel & Eieren"},
+        {"name": "chocolademelk", "category": "Dranken"},
+    ]
+    so.apply_fixed(items, {"hagelslag": "Brood & Bakkerij", "melk": "Overig",
+                           "chocolademelk": "Zuivel & Eieren"})
+    assert [i["category"] for i in items] == ["Brood & Bakkerij", "Zuivel & Eieren", "Zuivel & Eieren"]
+
+
+def test_optimize_uses_custom_categories_and_fixed_rules(monkeypatch):
+    settings = so.Settings(["Drogisterij", "Overig"], {"tandpasta": "Drogisterij"})
+    msg = claude_message({"items": [{"name": "tandpasta", "category": "Overig", "sources": [1]}]})
+    client = fake_client(msg)
+    monkeypatch.setattr(so, "_client", client)
+
+    items, _ = so.optimize_with_claude(["tandpasta"], settings)
+
+    kwargs = client.beta.messages.create.call_args.kwargs
+    enum = kwargs["output_config"]["format"]["schema"]["properties"]["items"]["items"]["properties"]["category"]["enum"]
+    assert enum == ["Drogisterij", "Overig"]
+    assert "tandpasta → Drogisterij" in kwargs["messages"][0]["content"]
+    assert items[0]["category"] == "Drogisterij"  # afgedwongen, ook al koos Claude Overig
+
+
+def test_build_plan_follows_custom_order_and_strips_old_prefixes(tmp_path, monkeypatch):
+    write_settings(tmp_path, {"volgorde": ["Dranken", "Groente & Fruit"]})
+    monkeypatch.setattr(so, "get_shopping_list", lambda: [
+        {"uid": "1", "name": "[Groente & Fruit] appels"}, {"uid": "2", "name": "cola"},
+    ])
+    seen = {}
+
+    def fake_optimize(names, settings):
+        seen["names"] = names
+        return [{"name": "appels", "category": "Groente & Fruit", "sources": [1]},
+                {"name": "cola", "category": "Dranken", "sources": [2]}], "ca. $0.001"
+
+    monkeypatch.setattr(so, "optimize_with_claude", fake_optimize)
+
+    plan = so.build_plan()
+
+    assert seen["names"] == ["appels", "cola"]
+    assert list(plan["categories"]) == ["Dranken", "Groente & Fruit"]
+    assert plan["cost"] == "ca. $0.001"
+
+
+def test_strip_prefix_with_custom_categories():
+    known = so._known_categories(["Drogisterij", "Overig"])
+    assert so.strip_prefix("[Drogisterij] [Dranken] shampoo", known) == "shampoo"
+
+
+# ── Kosten ────────────────────────────────────────────────────────────────────
+
+def usage_message(model, tokens_in, tokens_out):
+    return SimpleNamespace(model=model, usage=SimpleNamespace(input_tokens=tokens_in, output_tokens=tokens_out))
+
+
+def test_record_usage_estimates_cost_and_accumulates_per_month(tmp_path):
+    first = so.record_usage(usage_message("claude-opus-5", 1_000, 2_000))
+    so.record_usage(usage_message("claude-opus-5", 1_000, 2_000))
+
+    # 1000 × $5/M + 2000 × $25/M = $0.055 per run
+    assert first.startswith("ca. $0.055")
+    [month] = so._state["usage"].values()
+    assert month == {"runs": 2, "input_tokens": 2_000, "output_tokens": 4_000, "cost_usd": 0.11}
+    assert json.loads((tmp_path / "usage.json").read_text(encoding="utf-8")) == so._state["usage"]
+
+
+def test_record_usage_unknown_model_logs_tokens_only():
+    line = so.record_usage(usage_message("claude-nieuw-9", 10, 20))
+    assert "prijs onbekend" in line
+    [month] = so._state["usage"].values()
+    assert month["cost_usd"] == 0.0 and month["runs"] == 1
+
+
+def test_record_usage_matches_dated_model_ids():
+    assert so._price("claude-opus-5-20260101") == so.PRICES["claude-opus-5"]
+    assert so._price("claude-opus-5-5") == so.PRICES["claude-opus-5-5"]
