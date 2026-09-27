@@ -1,15 +1,18 @@
 # ── Home Assistant configuratie ───────────────────────────────────────────────
 #
 # Voeg dit toe aan je configuration.yaml (of een aparte package file)
-# om knoppen op je dashboard te maken die de optimizer triggert.
+# om knoppen op je dashboard te maken die de optimizer triggeren.
 #
 # Vervang JOUW_SERVER_IP door het IP van je Unraid server.
-# Vervang JOUW_WEBHOOK_SECRET door dezelfde waarde als WEBHOOK_SECRET in je .env
-# (of verwijder de headers sectie als je geen WEBHOOK_SECRET gebruikt).
+# Vervang JOUW_WEBHOOK_SECRET door dezelfde waarde als WEBHOOK_SECRET in je
+# docker-compose.yml (verplicht; de container start niet zonder).
+#
+# /preview en /optimize antwoorden direct ("gestart") en werken op de achtergrond;
+# het resultaat (of een foutmelding) verschijnt als HA-notificatie.
 
 # 1. REST commands — sturen webhooks naar de container
 rest_command:
-  # Direct optimaliseren zonder bevestiging (oud gedrag)
+  # Direct optimaliseren zonder bevestiging
   optimize_shopping_list:
     url: "http://JOUW_SERVER_IP:8099/optimize"
     method: POST
@@ -25,11 +28,12 @@ rest_command:
     headers:
       X-Webhook-Secret: "JOUW_WEBHOOK_SECRET"
 
-  # Stap 2a: Bevestig en pas de voorgestelde wijzigingen toe
+  # Stap 2a: Bevestig en pas het voorstel toe (schrijft de lijst terug, kan even duren)
   confirm_shopping_list:
     url: "http://JOUW_SERVER_IP:8099/confirm"
     method: POST
     content_type: "application/json"
+    timeout: 60
     headers:
       X-Webhook-Secret: "JOUW_WEBHOOK_SECRET"
 
@@ -69,7 +73,7 @@ script:
 
 # ── Dashboard knoppen ─────────────────────────────────────────────────────────
 #
-# Optie A: Direct optimaliseren (oud gedrag, één knop)
+# Optie A: Direct optimaliseren (één knop)
 #
 # type: button
 # name: Optimaliseer boodschappenlijst
