@@ -12,7 +12,10 @@ services:
       - HA_TOKEN=jouw_ha_token
       - ANTHROPIC_API_KEY=jouw_anthropic_key
       - WEBHOOK_SECRET=kies_een_sterk_geheim
-      - CLAUDE_MODEL=claude-opus-4-5
+      - CLAUDE_MODEL=claude-opus-5
+      - CLAUDE_EFFORT=low
+      - CLAUDE_FALLBACKS=default
+      - TODO_ENTITY=todo.shopping_list
       - REQUEST_TIMEOUT=10
       - PORT=8099
     volumes:

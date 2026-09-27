@@ -1,17 +1,30 @@
 # 🛒 Shopping List Optimizer
 
-Optimaliseert automatisch je Home Assistant shopping list via Claude AI:
+Optimaliseert je Home Assistant boodschappenlijst via Claude AI:
 - Voegt duplicaten samen (ook bij verschillende spellingen of hoeveelheden)
-- Groepeert items op categorie (Groente & Fruit, Vlees & Vis, etc.)
+- Groepeert items op categorie, in de volgorde van een looproute door de supermarkt
+- Optioneel met bevestigingsstap: eerst een voorstel als HA-notificatie, daarna bevestigen of annuleren
 - Draait als Docker container op Unraid
-- Triggerbaar via een knop op je HA dashboard
+- Triggerbaar via knoppen op je HA dashboard
+
+Vereist Home Assistant 2024.1 of nieuwer (gebruikt de `todo.*` services).
+
+## Veiligheid van je lijst
+
+- Nieuwe items worden eerst toegevoegd; pas daarna worden de originele items verwijderd (op uid). Gaat er halverwege iets mis, dan raak je niets kwijt.
+- Claude moet bij elk item aangeven uit welke originele items het bestaat. Valt er een item weg, dan wordt het voorstel afgekeurd en blijft de lijst ongewijzigd.
+- Is de lijst tussen voorstel en bevestiging gewijzigd (item afgevinkt of verwijderd), dan wordt het voorstel geweigerd en moet je een nieuw voorstel maken.
+- Eerdere categorie-prefixen (`[Groente & Fruit] ...`) worden gestript, dus je kunt de optimizer vaker achter elkaar draaien.
 
 ## Installatie
 
 ### 1. Maak de map aan op Unraid
 ```bash
 mkdir -p /mnt/user/appdata/shopping-optimizer
+chown -R 99:100 /mnt/user/appdata/shopping-optimizer
 ```
+
+> De container draait als `nobody:users` (99:100). Zonder de `chown` kan hij geen logs en openstaande voorstellen opslaan.
 
 ### 2. Maak een docker-compose.yml aan
 ```bash
@@ -20,8 +33,6 @@ nano /mnt/user/appdata/shopping-optimizer/docker-compose.yml
 
 Plak de volgende inhoud en vul je eigen waarden in:
 ```yaml
-# Locatie op Unraid: /mnt/user/appdata/shopping-optimizer
-
 services:
   shopping-optimizer:
     build: https://github.com/401-s/shopping-optimizer.git
@@ -34,9 +45,14 @@ services:
       - HA_TOKEN=jouw_ha_token
       - ANTHROPIC_API_KEY=jouw_anthropic_key
       - WEBHOOK_SECRET=kies_een_sterk_geheim
-      - CLAUDE_MODEL=claude-opus-4-5
+      - CLAUDE_MODEL=claude-opus-5
+      - CLAUDE_EFFORT=low
+      - CLAUDE_FALLBACKS=default
+      - TODO_ENTITY=todo.shopping_list
       - REQUEST_TIMEOUT=10
       - PORT=8099
+    volumes:
+      - /mnt/user/appdata/shopping-optimizer:/app/data
 ```
 
 > Docker haalt de broncode automatisch van GitHub — je hoeft de repo niet te clonen.
@@ -50,23 +66,37 @@ services:
 
 ### 4. Configureer Home Assistant
 Voeg de inhoud van `ha_configuration.yaml` toe aan je `configuration.yaml` en herstart HA.
+Daarin staan ook voorbeelden voor dashboardknoppen: één knop om direct te optimaliseren, of drie knoppen (voorstel / bevestig / annuleer).
 
-Voeg daarna een Button card toe aan je dashboard:
-```yaml
-type: button
-name: Optimaliseer boodschappenlijst
-icon: mdi:cart-check
-tap_action:
-  action: perform-action
-  perform_action: script.optimize_shopping_list
-```
+## Configuratie
+
+| Variabele | Verplicht | Standaard | Beschrijving |
+|-----------|-----------|-----------|--------------|
+| `HA_URL` | ja | | URL van Home Assistant |
+| `HA_TOKEN` | ja | | Long-Lived Access Token |
+| `ANTHROPIC_API_KEY` | ja | | Anthropic API key |
+| `WEBHOOK_SECRET` | ja | | Geheim dat HA meestuurt in de `X-Webhook-Secret` header |
+| `CLAUDE_MODEL` | nee | `claude-opus-5` | Claude-model. Goedkoper/sneller kan met `claude-sonnet-5` of `claude-haiku-4-5`; zet dan `CLAUDE_FALLBACKS` leeg (en bij Haiku ook `CLAUDE_EFFORT`) |
+| `CLAUDE_EFFORT` | nee | `low` | Denkinspanning (`low`–`max`). Leeg laten voor modellen die dit niet ondersteunen (zoals Haiku) |
+| `CLAUDE_FALLBACKS` | nee | leeg (uit) | `default` laat de API een geweigerd verzoek automatisch op een ander model herhalen. Alleen voor Claude Opus 5 / Fable; de voorbeeld-compose zet het aan |
+| `TODO_ENTITY` | nee | `todo.shopping_list` | Welke todo-lijst geoptimaliseerd wordt |
+| `REQUEST_TIMEOUT` | nee | `10` | Timeout (seconden) voor aanroepen naar HA |
+| `PORT` | nee | `8099` | Poort van de webserver |
+| `DATA_DIR` | nee | `/app/data` | Map voor logs en het openstaande voorstel |
 
 ## Endpoints
+
+Alle POST-endpoints vereisen de header `X-Webhook-Secret`. Er draait maximaal één actie tegelijk; een tweede aanvraag krijgt `409`.
 
 | Methode | URL | Beschrijving |
 |---------|-----|--------------|
 | GET | `/health` | Controleert of de container draait |
-| POST | `/optimize` | Start de optimalisatie |
+| POST | `/preview` | Maakt op de achtergrond een voorstel en toont het als HA-notificatie (`202`) |
+| POST | `/confirm` | Past het openstaande voorstel toe |
+| POST | `/cancel` | Gooit het openstaande voorstel weg |
+| POST | `/optimize` | Optimaliseert direct, zonder bevestiging, op de achtergrond (`202`) |
+
+Fouten bij achtergrondtaken verschijnen als HA-notificatie *Optimalisatie mislukt* en in `/app/data/logs/shopping-optimizer.log`.
 
 ## Tokens aanmaken
 
@@ -77,3 +107,10 @@ tap_action:
 **Anthropic API key:**
 1. Ga naar https://console.anthropic.com/settings/keys
 2. Klik op Create Key
+
+## Ontwikkelen
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
