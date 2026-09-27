@@ -2,7 +2,8 @@
 
 services:
   shopping-optimizer:
-    build: https://github.com/401-s/shopping-optimizer.git
+    image: ghcr.io/401-s/shopping-optimizer:latest
+    pull_policy: always
     container_name: shopping-optimizer
     restart: unless-stopped
     ports:

@@ -40,7 +40,8 @@ Plak de volgende inhoud en vul je eigen waarden in:
 ```yaml
 services:
   shopping-optimizer:
-    build: https://github.com/401-s/shopping-optimizer.git
+    image: ghcr.io/401-s/shopping-optimizer:latest
+    pull_policy: always
     container_name: shopping-optimizer
     restart: unless-stopped
     ports:
@@ -60,7 +61,9 @@ services:
       - /mnt/user/appdata/shopping-optimizer:/app/data
 ```
 
-> Docker haalt de broncode automatisch van GitHub — je hoeft de repo niet te clonen.
+> Het image wordt automatisch gebouwd door GitHub Actions en gepubliceerd op
+> `ghcr.io/401-s/shopping-optimizer`. Door `pull_policy: always` haalt elke Compose Up
+> de nieuwste versie op.
 
 ### 3. Start de container via Unraid Compose Manager
 - Ga in Unraid naar **Apps → Compose Manager**
@@ -137,6 +140,22 @@ Alle POST-endpoints vereisen de header `X-Webhook-Secret`. Er draait maximaal é
 
 Fouten bij achtergrondtaken verschijnen als HA-notificatie *Optimalisatie mislukt* en in `/app/data/logs/shopping-optimizer.log`.
 
+## Updaten en terug naar een vorige versie
+
+Updaten: **Compose Down → Compose Up** in Compose Manager; `pull_policy: always` haalt dan de nieuwste `latest` op.
+
+Beschikbare tags:
+
+| Tag | Wat |
+|-----|-----|
+| `latest` | Laatste versie van `main` |
+| `sha-abc1234` | Precies één commit, handig om terug te gaan |
+| `1.2.0` / `1.2` | Een versie, als er een tag `v1.2.0` is gezet |
+
+Terug naar een vorige versie: zet in je compose bijvoorbeeld
+`image: ghcr.io/401-s/shopping-optimizer:sha-abc1234` en doe Compose Down → Up.
+De beschikbare tags staan op https://github.com/401-s/shopping-optimizer/pkgs/container/shopping-optimizer.
+
 ## Tokens aanmaken
 
 **Home Assistant token:**
@@ -155,3 +174,5 @@ pytest
 ```
 
 Bij elke push naar `main` en elke pull request draait GitHub Actions de tests en bouwt het Docker image.
+Na een geslaagde push naar `main` (of een versietag zoals `v1.2.0`) wordt het image gepubliceerd op
+`ghcr.io/401-s/shopping-optimizer`.
